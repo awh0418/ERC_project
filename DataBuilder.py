@@ -1,7 +1,7 @@
 import csv
 from torch.utils.data import Dataset
-
-
+from transformers import RobertaTokenizer
+import torch
 
 def split(session):
     final_data = []
@@ -18,6 +18,7 @@ class data_loader(Dataset):
         
         """ 추가 """
         emoSet = set()
+        self.tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
 
         """ 세션 데이터 저장할 것"""
         self.session_dataset = []
@@ -68,7 +69,31 @@ class data_loader(Dataset):
     
     def __getitem__(self, idx): # 기본적인 구성
         return self.session_dataset[idx]
-    
+
+    def padding(self, batch_input_token):
+        """ 추가 """
+        """ 512 토큰 길이 넘으면 잘라내기 """
+        batch_token_ids, batch_attention_masks = batch_input_token['input_ids'], batch_input_token['attention_mask']
+        trunc_batch_token_ids, trunc_batch_attention_masks = [], []
+        for batch_token_id, batch_attention_mask in zip(batch_token_ids, batch_attention_masks):
+            if len(batch_token_id) > self.tokenizer.model_max_length:
+                trunc_batch_token_id = [batch_token_id[0]] + batch_token_id[1:][-self.tokenizer.model_max_length+1:]
+                trunc_batch_attention_mask = [batch_attention_mask[0]] + batch_attention_mask[1:][-self.tokenizer.model_max_length+1:]
+                trunc_batch_token_ids.append(trunc_batch_token_id)
+                trunc_batch_attention_masks.append(trunc_batch_attention_mask)
+            else:
+                trunc_batch_token_ids.append(batch_token_id)
+                trunc_batch_attention_masks.append(batch_attention_mask)
+        
+        """ padding token으로 패딩하기 """
+        # trunc_batch_token_ids 의 input 중에 max길이로 padding
+        max_length = max([len(x) for x in trunc_batch_token_ids])
+        padding_tokens, padding_attention_masks = [], []
+        for batch_token_id, batch_attention_mask in zip(trunc_batch_token_ids, trunc_batch_attention_masks):
+            padding_tokens.append(batch_token_id + [self.tokenizer.pad_token_id for _ in range(max_length-len(batch_token_id))])
+            padding_attention_masks.append(batch_attention_mask + [0 for _ in range(max_length-len(batch_token_id))]                                                        )
+        return torch.tensor(padding_tokens), torch.tensor(padding_attention_masks)
+
     def collate_fn(self, sessions): # 배치를 위한 구성
         '''
             input:
@@ -77,12 +102,40 @@ class data_loader(Dataset):
                 batch_input_tokens_pad: (B, L) padded
                 batch_labels: (B)
         '''
-        batch_input_token = []
-        for session in sessions:
-            input_token = ""
-            for line in session:
-                speaker, utt, emotion = line
-                input_token += utt
-            batch_input_token.append(input_token)
+        # gpu환경 등을 고려해서 조절 가능한 부분
+        # 예를들어 [발화1, 발화2, ..., 발화8] 이라면
+        # 발화1 ~ 발화7을 컨텍스트로 사용한다면 입력이 길어진다.
+        # 발화1 의 경우 발화8 에 덜 중요할 것 이기 때문에
+        # 적절하게 컨텍스트 길이를 조절해도 괜찮음
+        # ex) 3개로 정한다면, [발화5, 발화6, 발화7, 발화8]
         
-        return batch_input_token
+        """ 추가 """
+        # batch_input : CoM input
+        # batch_PM_input : PM input
+        batch_input, batch_labels = [], []
+        batch_PM_input = []
+        for session in sessions:
+            input_str = self.tokenizer.cls_token
+
+            """ For PM """
+            # PM input은 하나가 아님
+            # 예를들어 CoM의 input에서 u6발화에 대한 화자 Sa가 말한 다른 발화 u1, u3를 input 으로
+            current_speaker, current_utt, current_emotion = session[-1]
+            PM_input = []
+            for i, line in enumerate(session):
+                speaker, utt, emotion = line
+                input_str += " " + utt + self.tokenizer.sep_token
+                if i < len(session)-1 and current_speaker == speaker:
+                    PM_input.append(self.tokenizer.encode(utt, add_special_tokens=True, return_tensors='pt'))
+                    # [cls_token, tokens, sep_token] 의 형태
+
+            """ For CoM """
+            # 각 발화를 special token으로 concat 한 후 cls_token을 맨 앞에 두는 형태의 input
+            batch_input.append(input_str)
+            batch_labels.append(self.emoList.index(emotion))
+            batch_PM_input.append(PM_input)
+        # CoM input은 현재 토큰화 되지 않은 string인 상태이기 때문에 토큰화 해줌
+        batch_input_token = self.tokenizer(batch_input, add_special_tokens=False)
+        batch_padding_token, batch_padding_attention_mask = self.padding(batch_input_token)
+
+        return batch_padding_token, batch_padding_attention_mask, batch_PM_input, torch.tensor(batch_labels)       
